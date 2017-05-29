@@ -4,8 +4,9 @@ import os
 import sys
 from importlib import import_module
 
-from django.apps import apps
+from django.apps import apps as global_apps
 from django.conf import settings
+from django.db import migrations, router
 from django.db.migrations.graph import MigrationGraph
 from django.db.migrations.recorder import MigrationRecorder
 from django.utils import six
@@ -56,7 +57,7 @@ class MigrationLoader(object):
         if app_label in settings.MIGRATION_MODULES:
             return settings.MIGRATION_MODULES[app_label]
         else:
-            app_package_name = apps.get_app_config(app_label).name
+            app_package_name = global_apps.get_app_config(app_label).name
             return '%s.%s' % (app_package_name, MIGRATIONS_MODULE_NAME)
 
     def load_disk(self):
@@ -66,7 +67,7 @@ class MigrationLoader(object):
         self.disk_migrations = {}
         self.unmigrated_apps = set()
         self.migrated_apps = set()
-        for app_config in apps.get_app_configs():
+        for app_config in global_apps.get_app_configs():
             # Get the migrations module directory
             module_name = self.migrations_module(app_config.label)
             if module_name is None:
@@ -315,3 +316,82 @@ class MigrationLoader(object):
         See graph.make_state for the meaning of "nodes" and "at_end"
         """
         return self.graph.make_state(nodes=nodes, at_end=at_end, real_apps=list(self.unmigrated_apps))
+
+    def detect_soft_applied(self, project_state, migration):
+        """
+        Tests whether a migration has been implicitly applied - that the
+        tables or columns it would create exist. This is intended only for use
+        on initial migrations (as it only looks for CreateModel and AddField).
+        """
+        def should_skip_detecting_model(migration, model):
+            """
+            No need to detect tables for proxy models, unmanaged models, or
+            models that can't be migrated on the current database.
+            """
+            return (
+                model._meta.proxy or not model._meta.managed or not
+                router.allow_migrate(
+                    self.connection.alias, migration.app_label,
+                    model_name=model._meta.model_name,
+                )
+            )
+
+        if migration.initial is None:
+            # Bail if the migration isn't the first one in its app
+            if any(app == migration.app_label for app, name in migration.dependencies):
+                return False, project_state
+        elif migration.initial is False:
+            # Bail if it's NOT an initial migration
+            return False, project_state
+
+        if project_state is None:
+            after_state = self.project_state((migration.app_label, migration.name), at_end=True)
+        else:
+            after_state = migration.mutate_state(project_state)
+        apps = after_state.apps
+        found_create_model_migration = False
+        found_add_field_migration = False
+        existing_table_names = self.connection.introspection.table_names(self.connection.cursor())
+        # Make sure all create model and add field operations are done
+        for operation in migration.operations:
+            if isinstance(operation, migrations.CreateModel):
+                model = apps.get_model(migration.app_label, operation.name)
+                if model._meta.swapped:
+                    # We have to fetch the model to test with from the
+                    # main app cache, as it's not a direct dependency.
+                    model = global_apps.get_model(model._meta.swapped)
+                if should_skip_detecting_model(migration, model):
+                    continue
+                if model._meta.db_table not in existing_table_names:
+                    return False, project_state
+                found_create_model_migration = True
+            elif isinstance(operation, migrations.AddField):
+                model = apps.get_model(migration.app_label, operation.model_name)
+                if model._meta.swapped:
+                    # We have to fetch the model to test with from the
+                    # main app cache, as it's not a direct dependency.
+                    model = global_apps.get_model(model._meta.swapped)
+                if should_skip_detecting_model(migration, model):
+                    continue
+
+                table = model._meta.db_table
+                field = model._meta.get_field(operation.name)
+
+                # Handle implicit many-to-many tables created by AddField.
+                if field.many_to_many:
+                    if field.remote_field.through._meta.db_table not in existing_table_names:
+                        return False, project_state
+                    else:
+                        found_add_field_migration = True
+                        continue
+
+                column_names = [
+                    column.name for column in
+                    self.connection.introspection.get_table_description(self.connection.cursor(), table)
+                ]
+                if field.column not in column_names:
+                    return False, project_state
+                found_add_field_migration = True
+        # If we get this far and we found at least one CreateModel or AddField migration,
+        # the migration is considered implicitly applied.
+        return (found_create_model_migration or found_add_field_migration), after_state
