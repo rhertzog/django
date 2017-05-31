@@ -268,13 +268,14 @@ class MigrationLoader(object):
                     six.reraise(NodeNotFoundError, exc_value, sys.exc_info()[2])
             raise exc
 
-    def check_consistent_history(self, connection):
+    def check_consistent_history(self, connection, fake_initial=False):
         """
         Raise InconsistentMigrationHistory if any applied migrations have
         unapplied dependencies.
         """
         recorder = MigrationRecorder(connection)
         applied = recorder.applied_migrations()
+        msg = "Migration {}.{} is applied before its dependency {}.{} on database '{}'."
         for migration in applied:
             # If the migration is unknown, skip it.
             if migration not in self.graph.nodes:
@@ -286,9 +287,22 @@ class MigrationLoader(object):
                     if parent in self.replacements:
                         if all(m in applied for m in self.replacements[parent].replaces):
                             continue
+                    # Skip initial migration that is going to be fake-applied
+                    # unless a later migration in the same app has been
+                    # applied.
+                    if migration[0] != parent[0]:
+                        if self.detect_soft_applied(connection, None, self.graph.nodes[parent])[0]:
+                            if fake_initial:
+                                continue
+                            else:
+                                raise InconsistentMigrationHistory(
+                                    (msg + " The migration {}.{} may be faked using '--fake-initial'.").format(
+                                        migration[0], migration[1], parent[0], parent[1],
+                                        connection.alias, parent[0], parent[1],
+                                    )
+                                )
                     raise InconsistentMigrationHistory(
-                        "Migration {}.{} is applied before its dependency "
-                        "{}.{} on database '{}'.".format(
+                        msg.format(
                             migration[0], migration[1], parent[0], parent[1],
                             connection.alias,
                         )
@@ -317,7 +331,7 @@ class MigrationLoader(object):
         """
         return self.graph.make_state(nodes=nodes, at_end=at_end, real_apps=list(self.unmigrated_apps))
 
-    def detect_soft_applied(self, project_state, migration):
+    def detect_soft_applied(self, connection, project_state, migration):
         """
         Tests whether a migration has been implicitly applied - that the
         tables or columns it would create exist. This is intended only for use
@@ -331,7 +345,7 @@ class MigrationLoader(object):
             return (
                 model._meta.proxy or not model._meta.managed or not
                 router.allow_migrate(
-                    self.connection.alias, migration.app_label,
+                    connection.alias, migration.app_label,
                     model_name=model._meta.model_name,
                 )
             )
@@ -351,7 +365,7 @@ class MigrationLoader(object):
         apps = after_state.apps
         found_create_model_migration = False
         found_add_field_migration = False
-        existing_table_names = self.connection.introspection.table_names(self.connection.cursor())
+        existing_table_names = connection.introspection.table_names(connection.cursor())
         # Make sure all create model and add field operations are done
         for operation in migration.operations:
             if isinstance(operation, migrations.CreateModel):
@@ -387,7 +401,7 @@ class MigrationLoader(object):
 
                 column_names = [
                     column.name for column in
-                    self.connection.introspection.get_table_description(self.connection.cursor(), table)
+                    connection.introspection.get_table_description(connection.cursor(), table)
                 ]
                 if field.column not in column_names:
                     return False, project_state

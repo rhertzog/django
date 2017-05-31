@@ -76,6 +76,11 @@ class MigrationExecutor(object):
             for migration, _ in full_plan:
                 if migration in applied_migrations:
                     migration.mutate_state(state, preserve=False)
+                elif any(
+                    self.loader.graph.nodes[node] in applied_migrations
+                    for node in self.loader.graph.node_map[migration.app_label, migration.name].descendants()
+                ):
+                    _, state = self.loader.detect_soft_applied(self.connection, state, migration)
         return state
 
     def migrate(self, targets, plan=None, state=None, fake=False, fake_initial=False):
@@ -232,7 +237,7 @@ class MigrationExecutor(object):
         if not fake:
             if fake_initial:
                 # Test to see if this is an already-applied initial migration
-                applied, state = self.loader.detect_soft_applied(state, migration)
+                applied, state = self.loader.detect_soft_applied(self.connection, state, migration)
                 if applied:
                     fake = True
             if not fake:
